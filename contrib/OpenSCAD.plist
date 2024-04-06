@@ -179,6 +179,9 @@
 
 		<!--	Surface	 -->
 		<string>surface</string>
+
+		<!--	HeightMap	 -->
+		<string>heightmap</string>
 		
 		<!--	Search	 -->
 		<string>search</string>
