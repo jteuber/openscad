@@ -71,7 +71,11 @@ public:
   int pixelStep{1};
   std::array<double, 4> fadeTo;
   std::array<double, 4> fadeWidth;
+  std::string shapeExpr;
+  std::vector<Vector3d> shapeGridPoints;
+  std::vector<Vector3d> shapeGridNormals;
 
+  std::pair<unsigned int, unsigned int> getDataSize(std::string filename) const;
   std::unique_ptr<const Geometry> createGeometry() const override;
 private:
   void convert_image(map_data_t& data, std::vector<uint8_t>& img, unsigned int width, unsigned int height) const;

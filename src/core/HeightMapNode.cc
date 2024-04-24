@@ -43,6 +43,7 @@
 #include <CGAL/Algebraic_kernel_for_spheres_2_3.h>
 #include <CGAL/Distance_2/Line_2_Line_2.h>
 #include <CGAL/Kernel/global_functions_3.h>
+#include <Eigen/Sparse>
 #include <algorithm>
 #include <boost/spirit/home/support/common_terminals.hpp>
 #include <cstddef>
@@ -57,6 +58,7 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/assign/std/vector.hpp>
+#include <utility>
 using namespace boost::assign; // bring 'operator+=()' into scope
 
 #include <boost/filesystem.hpp>
@@ -68,6 +70,9 @@ namespace fs = boost::filesystem;
 #include <CGAL/Cartesian.h>
 #include <CGAL/Spherical_kernel_3.h>
 #include <CGAL/Exact_spherical_kernel_3.h>
+#include <CGAL/AABB_tree.h>
+#include <CGAL/AABB_traits.h>
+#include <CGAL/AABB_triangle_primitive.h>
 
 using Kernel = CGAL::Cartesian<double>;
 using Point = Kernel::Point_3;
@@ -82,6 +87,55 @@ using Segment = Kernel::Segment_3;
 using Ray = Kernel::Ray_3;
 using Intersection_p2p = boost::optional<boost::variant<Line_3, Plane_3>>;
 
+using Iterator = std::list<Triangle>::iterator;
+using Primitive = CGAL::AABB_triangle_primitive<Kernel, Iterator>;
+using AABB_triangle_traits = CGAL::AABB_traits<Kernel, Primitive>;
+using Tree = CGAL::AABB_tree<AABB_triangle_traits>;
+
+using SparseMatrix = Eigen::SparseMatrix<double>;
+
+
+enum class GridCoordType {
+  front_grid,
+  front_cell,
+  back_grid,
+  back_cell,
+  back_flat_x,
+  back_flat_y
+};
+int gridCoord2Idx(int x, int y, GridCoordType type, int columns, int rows) {
+  const int fullColumns = columns*2 - 1;
+  const int backOffset = columns*rows + (columns-1)*(rows-1);
+  switch (type) {
+    case GridCoordType::front_grid:
+      assert(x < columns && y < rows);
+      return y*fullColumns + x;
+    case GridCoordType::front_cell:
+      assert(x < columns-1 && y < rows-1);
+      return y*fullColumns + x + columns;
+    case GridCoordType::back_grid:
+      assert(x < columns && y < rows);
+      return backOffset + y*fullColumns + x;
+    case GridCoordType::back_cell:
+      assert(x < columns-1 && y < rows-1);
+      return backOffset + y*fullColumns + x + columns;
+    case GridCoordType::back_flat_x:
+      assert(x < columns && y < 2);
+      if (y == 0) {
+        return backOffset + x;
+      } else {
+        return backOffset + (columns+rows-2) + (columns-1)-x;
+      }
+    case GridCoordType::back_flat_y:
+      assert(x < 2 && y < rows);
+      if (x == 0) {
+        return backOffset + ((columns-1 + (columns+rows-2) + (rows-1)-y) % (2 * (columns - 1) + 2 * (rows - 1)));
+      } else {
+        return backOffset + columns-1 + y;
+      }
+  }
+  return 0;
+}
 
 static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation *inst, Arguments arguments, const Children& children)
 {
@@ -94,7 +148,7 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
 
   Parameters parameters =
       Parameters::parse(std::move(arguments), inst->location(),
-                        {"file", "size", "center", "convexity"}, {"invert", "doubleSided", "thickness", "pixelStep", "fadeTo", "fadeWidth"});
+                        {"file", "size", "center", "convexity"}, {"invert", "doubleSided", "thickness", "pixelStep", "fadeTo", "fadeWidth", "shape", "cutout"});
 
   std::string fileval = parameters["file"].isUndefined() ? "" : parameters["file"].toString();
   auto filename = lookup_file(fileval, inst->location().filePath().parent_path().string(), parameters.documentRoot());
@@ -156,6 +210,145 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
       node->fadeWidth[i] = 0;
   }
 
+  auto size = node->getDataSize(filename);
+  auto width = size.first;
+  auto height = size.second;
+
+  const unsigned int columns = ceil(width / node->pixelStep) + 1;
+  const unsigned int rows = ceil(height / node->pixelStep) + 1;
+
+  const int m = (rows * columns) + (rows - 1) * (columns - 1);
+  node->shapeGridPoints.resize(m);
+  node->shapeGridNormals.resize(m);
+
+  if (parameters["shape"].type() == Value::Type::FUNCTION) {
+    const FunctionType& func = parameters["shape"].toFunction();
+
+    std::stringstream exprStream;
+    func.getExpr()->print(exprStream, "  ");
+    node->shapeExpr = exprStream.str();
+
+    if (func.getParameters()->size() != 2) {
+      LOG(message_group::Error, inst->location(), parameters.documentRoot(), "heightmap(..., shape=%1$s) has to take exactly 2 arguments: u and v.", parameters["shape"].toEchoStringNoThrow());
+    }
+
+    ContextHandle<Context> c = Context::create<Context>(func.getContext());
+    c->set_variable("u", 0.0);
+    c->set_variable("v", 0.0);
+    const Value ret = func.getExpr()->evaluate(*c);
+    
+    if (ret.type() != Value::Type::VECTOR || 
+          (ret.toVector().size() != 3 && !(ret.toVector().size() == 2 && 
+              ret.toVector()[0].type() == Value::Type::VECTOR && 
+              ret.toVector()[0].toVector().size() == 3 && 
+              ret.toVector()[1].type() == Value::Type::VECTOR && 
+              ret.toVector()[1].toVector().size() == 3))) {
+      LOG(message_group::Error, inst->location(), parameters.documentRoot(), "heightmap(..., shape=%1$s) has to return either a 3-vector (location) or 2 3-vectors (location+normal).", parameters["shape"].toEchoStringNoThrow());
+    } else {
+
+      if (ret.toVector().size() == 3) {
+        for (unsigned int y=0; y<rows; ++y) {
+          double v = y / static_cast<double>(rows-1);
+          for (unsigned int x=0; x<columns; ++x) {
+            double u = x / static_cast<double>(columns-1);
+
+            c->set_variable("u", u);
+            c->set_variable("v", v);
+
+            Vector3d vec;
+            func.getExpr()->evaluate(*c).getVec3(vec.x(), vec.y(), vec.z());
+            node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = vec * node->size.x();
+          }
+        }
+        for (unsigned int y=0; y<rows; ++y) {
+          for (unsigned int x=0; x<columns; ++x) {
+            const Vector3d& left  = node->shapeGridPoints[gridCoord2Idx(std::max(x, 1u)-1,        y, GridCoordType::front_grid, columns, rows)];
+            const Vector3d& right = node->shapeGridPoints[gridCoord2Idx(std::min(x+1, columns-1), y, GridCoordType::front_grid, columns, rows)];
+            const Vector3d xVec = (right - left).normalized();
+
+            const Vector3d& top    = node->shapeGridPoints[gridCoord2Idx(x, std::max(y,   1u)-1,   GridCoordType::front_grid, columns, rows)];
+            const Vector3d& bottom = node->shapeGridPoints[gridCoord2Idx(x, std::min(y+1, rows-1), GridCoordType::front_grid, columns, rows)];
+            const Vector3d yVec = (bottom - top).normalized();
+            node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = xVec.cross(yVec).normalized();
+          }
+        }
+
+        for (unsigned int y=0; y<rows-1; ++y) {
+          double v = (y+0.5) / static_cast<double>(rows-1);
+          for (unsigned int x=0; x<columns-1; ++x) {
+            double u = (x+0.5) / static_cast<double>(columns-1);
+
+            c->set_variable("u", u);
+            c->set_variable("v", v);
+
+            Vector3d vec;
+            func.getExpr()->evaluate(*c).getVec3(vec.x(), vec.y(), vec.z());
+            node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = vec * node->size.x();
+          }
+        }
+        for (unsigned int y=0; y<rows-1; ++y) {
+          for (unsigned int x=0; x<columns-1; ++x) {
+            const Vector3d& left  = node->shapeGridPoints[gridCoord2Idx(std::max(x, 1u)-1,        y, GridCoordType::front_cell, columns, rows)];
+            const Vector3d& right = node->shapeGridPoints[gridCoord2Idx(std::min(x+1, columns-2), y, GridCoordType::front_cell, columns, rows)];
+            const Vector3d xVec = (right - left).normalized();
+
+            const Vector3d& top    = node->shapeGridPoints[gridCoord2Idx(x, std::max(y,   1u)-1,   GridCoordType::front_cell, columns, rows)];
+            const Vector3d& bottom = node->shapeGridPoints[gridCoord2Idx(x, std::min(y+1, rows-2), GridCoordType::front_cell, columns, rows)];
+            const Vector3d yVec = (bottom - top).normalized();
+            node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = xVec.cross(yVec).normalized();
+          }
+        }
+      } else {
+        for (unsigned int y=0; y<rows; ++y) {
+          double v = y / static_cast<double>(rows-1);
+          for (unsigned int x=0; x<columns; ++x) {
+            double u = x / static_cast<double>(columns-1);
+            c->set_variable("u", u);
+            c->set_variable("v", v);
+            const auto val = func.getExpr()->evaluate(*c);
+            const auto& vec = val.toVector();
+            const auto& pos = vec[0].toVector();
+            const auto& normal = vec[1].toVector();
+            node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = Vector3d(pos[0].toDouble(), pos[1].toDouble(), pos[2].toDouble()) * node->size.x();
+            node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = Vector3d(normal[0].toDouble(), normal[1].toDouble(), normal[2].toDouble()).normalized();
+          }
+        }
+        for (unsigned int y=0; y<rows-1; ++y) {
+          double v = (y+0.5) / static_cast<double>(rows-1);
+          for (unsigned int x=0; x<columns-1; ++x) {
+            double u = (x+0.5) / static_cast<double>(columns-1);
+            c->set_variable("u", u);
+            c->set_variable("v", v);
+            const auto val = func.getExpr()->evaluate(*c);
+            const auto& vec = val.toVector();
+            const auto& pos = vec[0].toVector();
+            const auto& normal = vec[1].toVector();
+            node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = Vector3d(pos[0].toDouble(), pos[1].toDouble(), pos[2].toDouble()) * node->size.x();
+            node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = Vector3d(normal[0].toDouble(), normal[1].toDouble(), normal[2].toDouble()).normalized();
+          }
+        }
+      }
+    }
+  } else {
+    for (unsigned int y=0; y<rows; ++y) {
+      const double v = y / static_cast<double>(rows-1);
+      for (unsigned int x=0; x<columns; ++x) {
+        const double u = x / static_cast<double>(columns-1);
+        node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = Vector3d(u, v, 0.5).cwiseProduct(node->size);
+        node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = Vector3d(0, 0, 1);
+      }
+    }
+    for (unsigned int y=0; y<rows-1; ++y) {
+      const double v = (y+0.5) / static_cast<double>(rows-1);
+      for (unsigned int x=0; x<columns-1; ++x) {
+        const double u = (x+0.5) / static_cast<double>(columns-1);
+        node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = Vector3d(u, v, 0.5).cwiseProduct(node->size);
+        node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = Vector3d(0, 0, 1);
+      }
+    }
+  }
+
+
   return node;
 }
 
@@ -166,11 +359,9 @@ void HeightMapNode::convert_image(map_data_t& data, std::vector<uint8_t>& img, u
   data.resize( (size_t)width * height);
   for (unsigned int y = 0; y < height; ++y) {
     for (unsigned int x = 0; x < width; ++x) {
-      long idx = 4l * (y * width + x);
-      double pixel = 0.2126 * img[idx] + 0.7152 * img[idx + 1] + 0.0722 * img[idx + 2];
-      double z = size.z() * pixel / 255.0;
-      if (size.z() < 0)
-        z -= size.z();
+      const long idx = 4l * (y * width + x);
+      const double pixel = 0.2126 * img[idx] + 0.7152 * img[idx + 1] + 0.0722 * img[idx + 2];
+      const double z = (pixel / 255.0) - 0.5;
       data[ x + (width * (height - 1 - y)) ] = z;
     }
   }
@@ -253,7 +444,7 @@ map_data_t HeightMapNode::read_dat(std::string filename) const
     try {
       for (const auto& token : tokens) {
         auto v = boost::lexical_cast<double>(token);
-        unordered_data[ std::make_pair(lines, col++) ] = size.z() * v;
+        unordered_data[ std::make_pair(lines, col++) ] = v;
         if (col > columns) columns = col;
       }
     } catch (const boost::bad_lexical_cast& blc) {
@@ -277,6 +468,12 @@ map_data_t HeightMapNode::read_dat(std::string filename) const
       data[ i * columns + j ] = unordered_data[std::make_pair(i, j)];
 
   return data;
+}
+
+std::pair<unsigned int, unsigned int> HeightMapNode::getDataSize(std::string filename) const
+{
+  auto data = read_png_or_dat(std::move(filename));
+  return std::make_pair(data.width, data.height);
 }
 
 std::pair<Point, Point> getClosestPoints(const Line_3& l1, const Line_3& l2) {
@@ -350,6 +547,23 @@ Vector3d getBottomSphereZLineIntersection(const Vector3d& center, double r, Vect
   return lineOrigin;
 }
 
+Vector3d getLastSphereLineIntersection(const Vector3d& center, double r, Vector3d lineOrigin, const Vector3d& direction) {
+  const Vector3d dist = center - lineOrigin;
+  const Vector3d zComponent = direction.dot(dist) * direction;
+  const double squaredDistance = (dist - zComponent).squaredNorm();
+  if (squaredDistance >= r * r)
+    return lineOrigin;
+
+  const double squaredHeight = (r*r) - squaredDistance;
+  const double height = std::sqrt(squaredHeight);
+
+  Vector3d bottomIntersection = lineOrigin + zComponent + height * direction;
+  if (direction.dot(bottomIntersection - lineOrigin) > 0)
+    return bottomIntersection;
+  else
+    return lineOrigin;
+}
+
 Vector3d getTriangleZLineIntersection(const Triangle& t, Vector3d p) {
   const Ray r(toPoint(p), Vector_3(0,0,-1));
   auto intersect = CGAL::intersection(r, t);
@@ -357,7 +571,16 @@ Vector3d getTriangleZLineIntersection(const Triangle& t, Vector3d p) {
   if (intersect && intersect->type() == typeid(Point)) {
     p = toVector3d(boost::get<Point>(*intersect));
   }
+  return p;
+}
 
+Vector3d getTriangleLineIntersection(const Triangle& t, Vector3d p, const Vector3d& direction) {
+  const Ray r(toPoint(p), Vector_3(direction.x(),direction.y(),direction.z()));
+  auto intersect = CGAL::intersection(r, t);
+
+  if (intersect && intersect->type() == typeid(Point)) {
+    p = toVector3d(boost::get<Point>(*intersect));
+  }
   return p;
 }
 
@@ -374,46 +597,23 @@ double getSweepingSphereZLineIntersectionZAtStart(const Vector3d& start, const V
   return line.y_at_x(0.0);
 }
 
-enum class GridCoordType {
-  front_grid,
-  front_cell,
-  back_grid,
-  back_cell,
-  back_flat_x,
-  back_flat_y
-};
-int gridCoord2Idx(int x, int y, GridCoordType type, int columns, int rows) {
-  const int fullColumns = columns*2 - 1;
-  const int backOffset = columns*rows + (columns-1)*(rows-1);
-  switch (type) {
-    case GridCoordType::front_grid:
-      assert(x < columns && y < rows);
-      return y*fullColumns + x;
-    case GridCoordType::front_cell:
-      assert(x < columns-1 && y < rows-1);
-      return y*fullColumns + x + columns;
-    case GridCoordType::back_grid:
-      assert(x < columns && y < rows);
-      return backOffset + y*fullColumns + x;
-    case GridCoordType::back_cell:
-      assert(x < columns-1 && y < rows-1);
-      return backOffset + y*fullColumns + x + columns;
-    case GridCoordType::back_flat_x:
-      assert(x < columns && y < 2);
-      if (y == 0) {
-        return backOffset + x;
-      } else {
-        return backOffset + (columns+rows-2) + (columns-1)-x;
-      }
-    case GridCoordType::back_flat_y:
-      assert(x < 2 && y < rows);
-      if (x == 0) {
-        return backOffset + ((columns-1 + (columns+rows-2) + (rows-1)-y) % (2 * (columns - 1) + 2 * (rows - 1)));
-      } else {
-        return backOffset + columns-1 + y;
-      }
-  }
-  return 0;
+Vector3d getPillLineIntersectionAtPillStart(const Vector3d& start, const Vector3d& end, double r, const Vector3d& direction) {
+  const Vector3d line = end - start;
+  const double up = direction.dot(line);
+
+  if (up <= 0.0)
+    return start + r * direction;
+
+  const Vector3d vertComponent = up * direction;
+  const Vector3d horComponent = line - vertComponent;
+  const double len = horComponent.norm();
+
+  Vector_2 n(up,len);
+  const double lenN = sqrt(up * up + len * len);
+  n /= lenN;
+  n *= r;
+  const Line_2 line2(Point_2(-n.x(),n.y()), Vector_2(len, up));
+  return start + direction * line2.y_at_x(0.0);
 }
 
 double getZAt(int row, int column, double xDataStep, double yDataStep, const map_data_t& data)
@@ -442,6 +642,9 @@ std::unique_ptr<const Geometry> HeightMapNode::createGeometry() const
 
   const double ox = center ? -width / 2.0 : 0;
   const double oy = center ? -height / 2.0 : 0;
+  const Vector3d centerOffset(ox, oy, 0);
+
+  const int m = (rows * columns) + (rows - 1) * (columns - 1);
 
   
   for (unsigned int y=0; y<std::ceil(fadeWidth[0]*data.height); ++y) {
@@ -473,12 +676,10 @@ std::unique_ptr<const Geometry> HeightMapNode::createGeometry() const
   }
 
   // reserve the polygon vector size so we don't have to reallocate as often
-  int numIndices = ((rows - 1) * (columns - 1) * 4); // heightmap (on top)
+  int numIndices = ((rows - 1) * (columns - 1) * 8); // heightmap (on top and bottom)
   numIndices += ((rows - 1) * 2 + (columns - 1) * 2); // sides
-  numIndices += doubleSided ? ((rows - 1) * (columns - 1) * 4) : 1; // bottom (heightmap or plane)
 
-  int numVertices = (rows * columns) + (rows - 1) * (columns - 1);
-  numVertices += doubleSided ? (rows * columns) + (rows - 1) * (columns - 1) : 2 * (columns - 1) + 2 * (rows - 1);
+  int numVertices = 2 * ((rows * columns) + (rows - 1) * (columns - 1));
                       
   auto polyset = std::make_unique<PolySet>(3);
   polyset->setConvexity(convexity);
@@ -487,24 +688,31 @@ std::unique_ptr<const Geometry> HeightMapNode::createGeometry() const
 
   for (unsigned int i = 0; i < rows; ++i) {
     for (unsigned int j = 0; j < columns; ++j) {
-      polyset->vertices[gridCoord2Idx(j, i, GridCoordType::front_grid, columns, rows)]  = Vector3d(ox + j * xStep, oy + i * yStep, getZAt(i, j, xDataStep, yDataStep, data));
+      const double z = getZAt(i, j, xDataStep, yDataStep, data);
+      const int idx = gridCoord2Idx(j, i, GridCoordType::front_grid, columns, rows);
+      const auto& pos = shapeGridPoints[idx] + centerOffset;
+      const auto& normal = shapeGridNormals[idx];
+      polyset->vertices[idx] = pos + normal * z * size.z();
     }
   }
   for (unsigned int i = 0; i < rows-1; ++i) {
     for (unsigned int j = 0; j < columns-1; ++j) {
-      double z = getZAt(i+0, j+0, xDataStep, yDataStep, data);
+      double z = getZAt(i, j, xDataStep, yDataStep, data);
       z += getZAt(i+0, j+1, xDataStep, yDataStep, data);
       z += getZAt(i+1, j+0, xDataStep, yDataStep, data);
       z += getZAt(i+1, j+1, xDataStep, yDataStep, data);
       z /= 4.0;
-      polyset->vertices[gridCoord2Idx(j, i, GridCoordType::front_cell, columns, rows)]  = Vector3d(ox + (j+0.5) * xStep, oy + (i+0.5) * yStep, z);
+      const int idx = gridCoord2Idx(j, i, GridCoordType::front_cell, columns, rows);
+      const auto& pos = shapeGridPoints[idx] + centerOffset;
+      const auto& normal = shapeGridNormals[idx];
+      polyset->vertices[idx] = (pos + normal * z * size.z());
     }
   }
 
   // the bulk of the heightmap
   for (unsigned int i = 0; i < rows-1; ++i) {
       const int top = i;
-      const int bottom = (i + 1);
+      const int bottom = i + 1;
 
       for (unsigned int j = 0; j < columns-1; ++j) {
         const int left = j;
@@ -526,199 +734,262 @@ std::unique_ptr<const Geometry> HeightMapNode::createGeometry() const
   if (doubleSided) {
     for (int y = 0; y < rows; ++y) {
       for (int x = 0; x < columns; ++x) {
-        polyset->vertices[gridCoord2Idx(x, y, GridCoordType::back_grid, columns, rows)]  = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)];
-        polyset->vertices[gridCoord2Idx(x, y, GridCoordType::back_grid, columns, rows)].z() -= thickness;
+        const int frontIdx = gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows);
+        const auto& normal = shapeGridNormals[frontIdx];
+        polyset->vertices[gridCoord2Idx(x, y, GridCoordType::back_grid, columns, rows)]  = polyset->vertices[frontIdx] - thickness * normal;
       }
     }
     for (int y = 0; y < rows-1; ++y) {
       for (int x = 0; x < columns-1; ++x) {
-        polyset->vertices[gridCoord2Idx(x, y, GridCoordType::back_cell, columns, rows)]  = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)];
-        polyset->vertices[gridCoord2Idx(x, y, GridCoordType::back_cell, columns, rows)].z() -= thickness;
+        const int frontIdx = gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows);
+        const auto& normal = shapeGridNormals[frontIdx];
+        polyset->vertices[gridCoord2Idx(x, y, GridCoordType::back_cell, columns, rows)]  = polyset->vertices[frontIdx] - thickness * normal;
       }
     }
+
+    // std::vector<Eigen::Triplet<double>> tripletList;
+
+    // for (int y1 = 0; y1 < rows; ++y1) {
+    //   for (int x1 = 0; x1 < columns; ++x1) {
+    //     const int idx1 = gridCoord2Idx(x1, y1, GridCoordType::front_grid, columns, rows);
+    //     const Vector3d& currentPoint = polyset->vertices[idx1];
+
+    //     for (int y2 = 0; y2 < rows; ++y2) {
+    //       for (int x2 = 0; x2 < columns; ++x2) {
+    //         const int idx2 = gridCoord2Idx(x2, y2, GridCoordType::front_grid, columns, rows);
+    //         const double dist = (currentPoint - polyset->vertices[idx2+m]).norm();
+    //         if (dist < thickness * 2)
+    //           tripletList.emplace_back(idx1, idx2, dist);
+    //       }
+    //     }
+        
+    //     for (int y2 = 0; y2 < rows-1; ++y2) {
+    //       for (int x2 = 0; x2 < columns-1; ++x2) {
+    //         const int idx2 = gridCoord2Idx(x2, y2, GridCoordType::front_cell, columns, rows);
+    //         const double dist = (currentPoint - polyset->vertices[idx2+m]).norm();
+    //         if (dist < thickness * 2)
+    //           tripletList.emplace_back(idx1, idx2, dist);
+    //       }
+    //     }
+    //   }
+    // }
+
+    // for (int y1 = 0; y1 < rows-1; ++y1) {
+    //   for (int x1 = 0; x1 < columns-1; ++x1) {
+    //     const int idx1 = gridCoord2Idx(x1, y1, GridCoordType::front_cell, columns, rows);
+    //     const Vector3d& currentPoint = polyset->vertices[idx1];
+
+    //     for (int y2 = 0; y2 < rows; ++y2) {
+    //       for (int x2 = 0; x2 < columns; ++x2) {
+    //         const int idx2 = gridCoord2Idx(x2, y2, GridCoordType::front_grid, columns, rows);
+    //         const double dist = (currentPoint - polyset->vertices[idx2+m]).norm();
+    //         if (dist < thickness * 2)
+    //           tripletList.emplace_back(idx1, idx2, dist);
+    //       }
+    //     }
+        
+    //     for (int y2 = 0; y2 < rows-1; ++y2) {
+    //       for (int x2 = 0; x2 < columns-1; ++x2) {
+    //         const int idx2 = gridCoord2Idx(x2, y2, GridCoordType::front_cell, columns, rows);
+    //         const double dist = (currentPoint - polyset->vertices[idx2+m]).norm();
+    //         if (dist < thickness * 2)
+    //           tripletList.emplace_back(idx1, idx2, dist);
+    //       }
+    //     }
+    //   }
+    // }
+
+    // create sparse matrix with the distance of the front vertices (rows) to the back vertices (columns)
+    // SparseMatrix influenceMatrix(m, m);
+    // influenceMatrix.setFromTriplets(tripletList.begin(), tripletList.end());
 
     const int rangeOfInfluenceX = std::ceil(thickness / xStep);
     const int rangeOfInfluenceY = std::ceil(thickness / yStep);
 
-    // per-point operations
-    if (rangeOfInfluenceX > 1) {
-      for (int i = 0; i < rows; ++i) {
-        for (int j = 0; j < columns; ++j) {
-          Vector3d& currentPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::back_grid, columns, rows)];
-
-          // for (int y = std::max(i-rangeOfInfluenceY, 0); y<std::min(i+rangeOfInfluenceY+1, rows-1); ++y) {
-          //   for (int x = std::max(j-rangeOfInfluenceX, 0); x<std::min(j+rangeOfInfluenceX+1, columns-1); ++x) {
-          //     const Vector3d& centerPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)];
-          //     if (centerPoint.z() - thickness < currentPoint.z()) {
-          //       currentPoint = getBottomSphereZLineIntersection(centerPoint, thickness, currentPoint);
-          //     }
-          //   }
-          // }
-
-          for (int y = std::max(i-rangeOfInfluenceY, 0); y<std::min(i+rangeOfInfluenceY+1, rows); ++y) {
-            for (int x = std::max(j-rangeOfInfluenceX, 0); x<std::min(j+rangeOfInfluenceX+1, columns); ++x) {
-              if (y == i && x == j)
-                continue;
-
-              const Vector3d& otherPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)];
-              if (otherPoint.z() - thickness < currentPoint.z()) {
-                currentPoint = getBottomSphereZLineIntersection(otherPoint, thickness, currentPoint);
-              }
-            }
-          }
-        }
-      }
-      for (int i = 0; i < rows-1; ++i) {
-        for (int j = 0; j < columns-1; ++j) {
-          Vector3d& currentPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::back_cell, columns, rows)];
-
-          for (int y = std::max(i-rangeOfInfluenceY, 0); y<std::min(i+rangeOfInfluenceY+1, rows); ++y) {
-            for (int x = std::max(j-rangeOfInfluenceX, 0); x<std::min(j+rangeOfInfluenceX+1, columns); ++x) {
-              const Vector3d& otherPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)];
-              if (otherPoint.z() - thickness < currentPoint.z()) {
-                currentPoint = getBottomSphereZLineIntersection(otherPoint, thickness, currentPoint);
-              }
-            }
-          }
-
-          // for (int y = std::max(i-rangeOfInfluenceY, 0); y<std::min(i+rangeOfInfluenceY+1, rows-1); ++y) {
-          //   for (int x = std::max(j-rangeOfInfluenceX, 0); x<std::min(j+rangeOfInfluenceX+1, columns-1); ++x) {
-          //     if (y == i && x == j)
-          //       continue;
-
-          //     const Vector3d& centerPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)];
-          //     if (centerPoint.z() - thickness < currentPoint.z()) {
-          //       currentPoint = getBottomSphereZLineIntersection(centerPoint, thickness, currentPoint);
-          //     }
-          //   }
-          // }
-        }
+    std::list<Triangle> triangles;
+    for(const auto& t : polyset->indices) {
+      if (t.size() == 3) {
+        const Point p1 = toPoint(polyset->vertices[t[0]]);
+        const Point p2 = toPoint(polyset->vertices[t[1]]);
+        const Point p3 = toPoint(polyset->vertices[t[2]]);
+        triangles.emplace_back(p1, p2, p3);
       }
     }
 
-    if (rangeOfInfluenceX < 5) {
+    Tree tree(triangles.begin(), triangles.end());
+    tree.accelerate_distance_queries();
 
-      std::vector<Triangle> triangles;
-      triangles.reserve((rows-1) * (columns-1) * 4);
-      for(const auto& t : polyset->indices) {
-        if (t.size() == 3) {
-          const Point p1 = toPoint(polyset->vertices[t[0]]);
-          const Point p2 = toPoint(polyset->vertices[t[1]]);
-          const Point p3 = toPoint(polyset->vertices[t[2]]);
+    for (int k=0; k<m; ++k) {
+      Vector3d& currentPoint = polyset->vertices[k+m];
+      const Vector3d& normal = -shapeGridNormals[k];
+      auto closest = tree.closest_point_and_primitive(toPoint(currentPoint));
+      double sqrDist = (toVector3d(closest.first)-currentPoint).squaredNorm();
+      while (sqrDist < thickness * thickness) {
+        currentPoint = getLastSphereLineIntersection(toVector3d(closest.first), thickness*1.01, currentPoint, normal);
+        for (int i=0; i<3; ++i) {
+          currentPoint = getLastSphereLineIntersection(toVector3d(closest.second->vertex(i)), thickness*1.01, currentPoint, normal);
+        }
+        if (rangeOfInfluenceX < 5) {
+          const Point& p1 = closest.second->vertex(0);
+          const Point& p2 = closest.second->vertex(1);
+          const Point& p3 = closest.second->vertex(2);
           const Vector_3 n = CGAL::unit_normal(p1, p2, p3);
-          const auto o = thickness * n;
-          triangles.emplace_back(p1 + o, p2 + o, p3 + o);
+          const auto o = thickness * 1.01 * n;
+          currentPoint = getTriangleLineIntersection(Triangle(p1 + o, p2 + o, p3 + o), currentPoint, normal);
         }
-      }
-      for (int i = 0; i < rows; ++i) {
-        for (int j = 0; j < columns; ++j) {
-          Vector3d& currentPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::back_grid, columns, rows)];
 
-          for (int y = std::max(i-rangeOfInfluenceY, 0); y<std::min(i+rangeOfInfluenceY+1, rows-1); ++y) {
-            for (int x = std::max(j-rangeOfInfluenceX, 0); x<std::min(j+rangeOfInfluenceX+1, columns-1); ++x) {
-              const int cellIdx = y*(columns-1) + x;
-              for (int k = 0; k < 4; ++k) {
-                const auto& t = triangles[cellIdx * 4 + k];
-                currentPoint = getTriangleZLineIntersection(t, currentPoint);
-              }
-            }
-          }
-        }
-      }
-      for (int i = 0; i < rows-1; ++i) {
-        for (int j = 0; j < columns-1; ++j) {
-          Vector3d& currentPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::back_cell, columns, rows)];
-
-          for (int y = std::max(i-rangeOfInfluenceY, 0); y<std::min(i+rangeOfInfluenceY+1, rows-1); ++y) {
-            for (int x = std::max(j-rangeOfInfluenceX, 0); x<std::min(j+rangeOfInfluenceX+1, columns-1); ++x) {
-              const int cellIdx = y*(columns-1) + x;
-              for (int k = 0; k < 4; ++k) {
-                const auto& t = triangles[cellIdx * 4 + k];
-                currentPoint = getTriangleZLineIntersection(t, currentPoint);
-              }
-            }
-          }
-        }
+        closest = tree.closest_point_and_primitive(toPoint(currentPoint), closest);
+        sqrDist = (toVector3d(closest.first)-currentPoint).squaredNorm();
       }
     }
 
-    if (rangeOfInfluenceX == 1) {
-      for (int i = 0; i < rows; ++i) {
-        for (int j = 0; j < columns; ++j) {
-          Vector3d& currentPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::back_grid, columns, rows)];
-          const Vector3d& frontPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::front_grid, columns, rows)];
+    // // per-point operations
+    // if (rangeOfInfluenceX > 1) {
+    //   for (int k=0; k<influenceMatrix.outerSize(); ++k) { // iterate over columns aka back vertices
+    //     const auto& normal = -shapeGridNormals[k];
+    //     Vector3d& currentPoint = polyset->vertices[k+m];
 
-          for (int y = std::max(i-rangeOfInfluenceY, 0); y<std::min(i+rangeOfInfluenceY+1, rows); ++y) {
-            for (int x = std::max(j-rangeOfInfluenceX, 0); x<std::min(j+rangeOfInfluenceX+1, columns); ++x) {
-              if (y == i && x == j)
-                continue;
+    //     // InnerIterator iterates over the rows in one column, i.e. the front vertices close enough to the kth back vertex
+    //     for (SparseMatrix::InnerIterator it(influenceMatrix,k); it; ++it) { 
+    //       const Vector3d& otherPoint = polyset->vertices[it.row()];
+    //       currentPoint = getLastSphereLineIntersection(otherPoint, thickness, currentPoint, normal);
+    //     }
+    //   }
+    // }
 
-              const Vector3d& otherPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)];
-              if (otherPoint.z() - thickness > currentPoint.z())
-                continue;
-              const double z = getSweepingSphereZLineIntersectionZAtStart(frontPoint, otherPoint, thickness);
-              if (z < currentPoint.z())
-                currentPoint.z() = z;
-            }
-          }
-        }
-      }
-    }
+    // if (rangeOfInfluenceX < 5) {
+    //   std::vector<Triangle> triangles;
+    //   triangles.reserve((rows-1) * (columns-1) * 4);
+    //   for(const auto& t : polyset->indices) {
+    //     if (t.size() == 3) {
+    //       const Point p1 = toPoint(polyset->vertices[t[0]]);
+    //       const Point p2 = toPoint(polyset->vertices[t[1]]);
+    //       const Point p3 = toPoint(polyset->vertices[t[2]]);
+          // const Vector_3 n = CGAL::unit_normal(p1, p2, p3);
+          // const auto o = thickness * n;
+          // triangles.emplace_back(p1 + o, p2 + o, p3 + o);
+    //     }
+    //   }
+      
+    //   const int fullColumns = columns*2 - 1;
+    //   for (int k=0; k<influenceMatrix.outerSize(); ++k) { // iterate over columns aka back vertices
+    //     const auto& normal = -shapeGridNormals[k];
+    //     Vector3d& currentPoint = polyset->vertices[k+m];
 
-    for (unsigned int i = 1; i < rows; ++i) {
-      const int top = (i - 1);
-      const int bottom = i;
+    //     // InnerIterator iterates over the rows in one column, i.e. the front vertices close enough to the kth back vertex
+    //     for (SparseMatrix::InnerIterator it(influenceMatrix,k); it; ++it) {
+    //       if (it.row() % fullColumns > columns) {
+    //         const int cellX = it.row() % fullColumns - columns;
+    //         const int cellY = it.row() / fullColumns;
+    //         const int cellIdx = cellY*(columns-1) + cellX;
+    //         for (int t = 0; t < 4; ++t) {
+    //           const auto& tri = triangles[cellIdx * 4 + t];
+    //           currentPoint = getTriangleLineIntersection(tri, currentPoint, normal);
+    //         }
+    //       }
+    //     }
+    //   }
+    // }
 
-      for (unsigned int j = 1; j < columns; ++j) {
-        const int left = (j - 1);
-        const int right = j;
+    // if (rangeOfInfluenceX == 1) {
+    //   const auto gridNeighbors = std::array<std::pair<int, int>,4>{std::make_pair(0,1), {1,0}, {0,-1}, {-1,0}};
+    //   const auto cellNeighbors = std::array<std::pair<int, int>,4>{std::make_pair(0,0), {-1,0}, {-1,-1}, {0,-1}};
+    //   for (int i = 0; i < rows; ++i) {
+    //     for (int j = 0; j < columns; ++j) {
+    //       const int frontIdx = gridCoord2Idx(j, i, GridCoordType::front_grid, columns, rows);
+    //       const auto& normal = shapeGridNormals[frontIdx];
+    //       const Vector3d& frontPoint = polyset->vertices[frontIdx];
+    //       Vector3d& currentPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::back_grid, columns, rows)];
 
-        const int topLeft     = gridCoord2Idx(left,  top,    GridCoordType::back_grid, columns, rows);
-        const int topRight    = gridCoord2Idx(right, top,    GridCoordType::back_grid, columns, rows);
-        const int bottomLeft  = gridCoord2Idx(left,  bottom, GridCoordType::back_grid, columns, rows);
-        const int bottomRight = gridCoord2Idx(right, bottom, GridCoordType::back_grid, columns, rows);
-        const int center      = gridCoord2Idx(left,  top,    GridCoordType::back_cell, columns, rows);
+    //       for (const auto& coord: gridNeighbors) {
+    //         const int x = j + coord.first;
+    //         if (x<0 || x>=columns) continue;
+    //         const int y = i + coord.second;
+    //         if (y<0 || y>=rows) continue;
 
-        polyset->indices.push_back(IndexedFace({topRight, topLeft, center}));
-        polyset->indices.push_back(IndexedFace({topLeft, bottomLeft, center}));
-        polyset->indices.push_back(IndexedFace({bottomLeft, bottomRight, center}));
-        polyset->indices.push_back(IndexedFace({bottomRight, topRight, center}));
-      }
-    }
+    //         const Vector3d& otherPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)];
+    //         const Vector3d intersection = getPillLineIntersectionAtPillStart(frontPoint, otherPoint, thickness, -normal);
+    //         if (normal.dot(currentPoint - intersection) > 0)
+    //           currentPoint = intersection;
+    //       }
+    //       for (const auto& coord: cellNeighbors) {
+    //         const int x = j + coord.first;
+    //         if (x<0 || x>=columns-1) continue;
+    //         const int y = i + coord.second;
+    //         if (y<0 || y>=rows-1) continue;
+
+    //         const Vector3d& otherPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)];
+    //         const Vector3d intersection = getPillLineIntersectionAtPillStart(frontPoint, otherPoint, thickness, -normal);
+    //         if (normal.dot(currentPoint - intersection) > 0)
+    //           currentPoint = intersection;
+    //       }
+    //     }
+    //   }
+    //   const auto cellGridNeighbors = std::array<std::pair<int, int>,4>{std::make_pair(0,0), {1,0}, {1,1}, {0,1}};
+    //   for (int i = 0; i < rows-1; ++i) {
+    //     for (int j = 0; j < columns-1; ++j) {
+    //       const int frontIdx = gridCoord2Idx(j, i, GridCoordType::front_cell, columns, rows);
+    //       const auto& normal = shapeGridNormals[frontIdx];
+    //       const Vector3d& frontPoint = polyset->vertices[frontIdx];
+    //       Vector3d& currentPoint = polyset->vertices[gridCoord2Idx(j, i, GridCoordType::back_cell, columns, rows)];
+
+    //       for (const auto& coord: cellGridNeighbors) {
+    //         const int x = j + coord.first;
+    //         const int y = i + coord.second;
+
+    //         const Vector3d& otherPoint = polyset->vertices[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)];
+    //         const Vector3d intersection = getPillLineIntersectionAtPillStart(frontPoint, otherPoint, thickness, -normal);
+    //         if (normal.dot(currentPoint - intersection) > 0)
+    //           currentPoint = intersection;
+    //       }
+    //     }
+    //   }
+    // }
   }
   else if (columns > 1 && rows > 1) {
-    // the bottom of the shape (one less than the real minimum value), making it a
-    // solid volume
-    IndexedFace face;
-    face.resize(2 * (columns - 1) + 2 * (rows - 1));
-    int indexIdx = 2 * (columns - 1) + 2 * (rows - 1);
-    for (int i = 0; i < columns - 1; ++i) {
-      const int idx = gridCoord2Idx(i, 0, GridCoordType::back_flat_x, columns, rows);
-      polyset->vertices[idx] = Vector3d(ox + i * xStep, oy + 0, -thickness);
-      face[--indexIdx] = idx;
+    for (unsigned int i = 0; i < rows; ++i) {
+      for (unsigned int j = 0; j < columns; ++j) {
+        const int idx = gridCoord2Idx(j, i, GridCoordType::front_grid, columns, rows);
+        const auto& pos = shapeGridPoints[idx] + centerOffset;
+        const auto& normal = shapeGridNormals[idx];
+        polyset->vertices[idx+m] = pos - normal * (size.z()/2 + thickness);
+      }
     }
-    for (int i = 0; i < rows - 1; ++i) {
-      const int idx = gridCoord2Idx(1, i, GridCoordType::back_flat_y, columns, rows);
-      polyset->vertices[idx] = Vector3d(ox + width, oy + i * yStep, -thickness);
-      face[--indexIdx] = idx;
+    for (unsigned int i = 0; i < rows-1; ++i) {
+      for (unsigned int j = 0; j < columns-1; ++j) {
+        const int idx = gridCoord2Idx(j, i, GridCoordType::front_cell, columns, rows);
+        const auto& pos = shapeGridPoints[idx] + centerOffset;
+        const auto& normal = shapeGridNormals[idx];
+        polyset->vertices[idx+m] = pos - normal * (size.z()/2 + thickness);
+      }
     }
-    for (int i = columns - 1; i > 0; --i) {
-      const int idx = gridCoord2Idx(i, 1, GridCoordType::back_flat_x, columns, rows);
-      polyset->vertices[idx] = Vector3d(ox + i * xStep, oy + height, -thickness);
-      face[--indexIdx] = idx;
-    }
-    for (int i = rows - 1; i > 0; --i) {
-      const int idx = gridCoord2Idx(0, i, GridCoordType::back_flat_y, columns, rows);
-      polyset->vertices[idx] = Vector3d(ox + 0, oy + i * yStep, -thickness);
-      face[--indexIdx] = idx;
-    }
-    polyset->indices.push_back(face);
   }
 
-  const GridCoordType backType_x = doubleSided ? GridCoordType::back_grid : GridCoordType::back_flat_x;
-  const GridCoordType backType_y = doubleSided ? GridCoordType::back_grid : GridCoordType::back_flat_y;
-  const int back_maxX = doubleSided ? columns-1 : 1;
-  const int back_maxY = doubleSided ? rows-1 : 1;
+  for (unsigned int i = 1; i < rows; ++i) {
+    const int top = (i - 1);
+    const int bottom = i;
+
+    for (unsigned int j = 1; j < columns; ++j) {
+      const int left = (j - 1);
+      const int right = j;
+
+      const int topLeft     = gridCoord2Idx(left,  top,    GridCoordType::back_grid, columns, rows);
+      const int topRight    = gridCoord2Idx(right, top,    GridCoordType::back_grid, columns, rows);
+      const int bottomLeft  = gridCoord2Idx(left,  bottom, GridCoordType::back_grid, columns, rows);
+      const int bottomRight = gridCoord2Idx(right, bottom, GridCoordType::back_grid, columns, rows);
+      const int center      = gridCoord2Idx(left,  top,    GridCoordType::back_cell, columns, rows);
+
+      polyset->indices.push_back(IndexedFace({topRight, topLeft, center}));
+      polyset->indices.push_back(IndexedFace({topLeft, bottomLeft, center}));
+      polyset->indices.push_back(IndexedFace({bottomLeft, bottomRight, center}));
+      polyset->indices.push_back(IndexedFace({bottomRight, topRight, center}));
+    }
+  }
+
+  const GridCoordType backType_x = GridCoordType::back_grid;
+  const GridCoordType backType_y = GridCoordType::back_grid;
+  const int back_maxX = columns-1;
+  const int back_maxY = rows-1;
 
   // edges along Y
   for (int i = 0; i < rows-1; ++i) {
@@ -766,6 +1037,7 @@ std::string HeightMapNode::toString() const
          << ", pixelStep = " << this->pixelStep
          << ", fadeTo = [" << this->fadeTo[0] << ", " << this->fadeTo[1] << ", " << this->fadeTo[2] << ", " << this->fadeTo[3] << "]"
          << ", fadeWidth = [" << this->fadeWidth[0] << ", " << this->fadeWidth[1] << ", " << this->fadeWidth[2] << ", " << this->fadeWidth[3] << "]"
+         << ", shape = " << shapeExpr
          << ", "
             "timestamp = "
          << (fs::exists(path) ? fs::last_write_time(path) : 0) << ")";
@@ -777,6 +1049,6 @@ void register_builtin_heightmap()
 {
   Builtins::init("heightmap", new BuiltinModule(builtin_heightmap),
                  {
-                     "heightmap(string, size = [1,1,1], center = false, invert = false, convexity = number, doubleSided = false, thickness = 1, pixelStep = 1, fadeTo = 0, fadeWidth = 0)",
+                     "heightmap(string, size = [1,1,1], center = false, invert = false, convexity = number, doubleSided = false, thickness = 1, pixelStep = 1, fadeTo = 0, fadeWidth = 0, shape = 0)",
                  });
 }
