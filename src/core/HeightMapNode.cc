@@ -99,11 +99,9 @@ enum class GridCoordType {
   front_grid,
   front_cell,
   back_grid,
-  back_cell,
-  back_flat_x,
-  back_flat_y
+  back_cell
 };
-int gridCoord2Idx(int x, int y, GridCoordType type, int columns, int rows) {
+inline int gridCoord2Idx(int x, int y, GridCoordType type, int columns, int rows) {
   const int fullColumns = columns*2 - 1;
   const int backOffset = columns*rows + (columns-1)*(rows-1);
   switch (type) {
@@ -119,20 +117,6 @@ int gridCoord2Idx(int x, int y, GridCoordType type, int columns, int rows) {
     case GridCoordType::back_cell:
       assert(x < columns-1 && y < rows-1);
       return backOffset + y*fullColumns + x + columns;
-    case GridCoordType::back_flat_x:
-      assert(x < columns && y < 2);
-      if (y == 0) {
-        return backOffset + x;
-      } else {
-        return backOffset + (columns+rows-2) + (columns-1)-x;
-      }
-    case GridCoordType::back_flat_y:
-      assert(x < 2 && y < rows);
-      if (x == 0) {
-        return backOffset + ((columns-1 + (columns+rows-2) + (rows-1)-y) % (2 * (columns - 1) + 2 * (rows - 1)));
-      } else {
-        return backOffset + columns-1 + y;
-      }
   }
   return 0;
 }
@@ -148,7 +132,7 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
 
   Parameters parameters =
       Parameters::parse(std::move(arguments), inst->location(),
-                        {"file", "size", "center", "convexity"}, {"invert", "doubleSided", "thickness", "pixelStep", "fadeTo", "fadeWidth", "shape", "cutout", "tiles"});
+                        {"file", "size", "center", "convexity"}, {"doubleSided", "thickness", "pixelStep", "fadeTo", "fadeWidth", "shape", "cutout", "tiles", "tileStart"});
 
   std::string fileval = parameters["file"].isUndefined() ? "" : parameters["file"].toString();
   auto filename = lookup_file(fileval, inst->location().filePath().parent_path().string(), parameters.documentRoot());
@@ -190,9 +174,12 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
     for(int i=0; i<4; ++i)
       node->fadeTo[i] = vec[i].toDouble();
   } else if (parameters["fadeTo"].type() == Value::Type::NUMBER) {
-    double v = parameters["fadeTo"].toDouble();
+    const double v = parameters["fadeTo"].toDouble();
     for(int i=0; i<4; ++i)
       node->fadeTo[i] = v;
+  } else {
+    for(int i=0; i<4; ++i)
+      node->fadeTo[i] = 0;
   }
 
   if (parameters["fadeWidth"].type() == Value::Type::VECTOR) {
@@ -202,7 +189,7 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
     for(int i=0; i<4; ++i)
       node->fadeWidth[i] = vec[i].toDouble();
   } else if (parameters["fadeWidth"].type() == Value::Type::NUMBER) {
-    double v = parameters["fadeWidth"].toDouble();
+    const double v = parameters["fadeWidth"].toDouble();
     for(int i=0; i<4; ++i)
       node->fadeWidth[i] = v;
   } else {
@@ -217,10 +204,21 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
     node->tiles[1] = 1.0;
   }
 
-  auto size = node->getDataSize(filename);
-  auto width = size.first;
-  auto height = size.second;
+  if (parameters["tileStart"].type() == Value::Type::VECTOR) {
+    parameters["tileStart"].getVec2(node->tileStart[0], node->tileStart[1]);
+  } else {
+    node->tileStart[0] = 0.0;
+    node->tileStart[1] = 0.0;
+  }
 
+  auto size = node->getDataSize(filename);
+  auto tileWidth = size.first;
+  auto tileHeight = size.second;
+  auto width = size.first * node->tiles[0];
+  auto height = size.second * node->tiles[1];
+
+  const unsigned int tileColumns = ceil(tileWidth / node->pixelStep) + 1;
+  const unsigned int tileRows = ceil(tileHeight / node->pixelStep) + 1;
   const unsigned int columns = ceil(width / node->pixelStep) + 1;
   const unsigned int rows = ceil(height / node->pixelStep) + 1;
 
@@ -255,9 +253,9 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
 
       if (ret.toVector().size() == 3) {
         for (unsigned int y=0; y<rows; ++y) {
-          double v = y / static_cast<double>(rows-1);
+          const double v = (y / static_cast<double>(tileRows-1)) + node->tileStart[1];
           for (unsigned int x=0; x<columns; ++x) {
-            double u = x / static_cast<double>(columns-1);
+            const double u = (x / static_cast<double>(tileColumns-1)) + node->tileStart[0];
 
             c->set_variable("u", u);
             c->set_variable("v", v);
@@ -281,9 +279,9 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
         }
 
         for (unsigned int y=0; y<rows-1; ++y) {
-          double v = (y+0.5) / static_cast<double>(rows-1);
+          const double v = ((y+0.5) / static_cast<double>(tileRows-1)) + node->tileStart[1];
           for (unsigned int x=0; x<columns-1; ++x) {
-            double u = (x+0.5) / static_cast<double>(columns-1);
+            const double u = ((x+0.5) / static_cast<double>(tileColumns-1) + node->tileStart[0]);
 
             c->set_variable("u", u);
             c->set_variable("v", v);
@@ -307,9 +305,9 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
         }
       } else {
         for (unsigned int y=0; y<rows; ++y) {
-          double v = y / static_cast<double>(rows-1);
+          const double v = (y / static_cast<double>(tileRows-1)) + node->tileStart[1];
           for (unsigned int x=0; x<columns; ++x) {
-            double u = x / static_cast<double>(columns-1);
+            const double u = (x / static_cast<double>(tileColumns-1)) + node->tileStart[0];
             c->set_variable("u", u);
             c->set_variable("v", v);
             const auto val = func.getExpr()->evaluate(*c);
@@ -321,9 +319,9 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
           }
         }
         for (unsigned int y=0; y<rows-1; ++y) {
-          double v = (y+0.5) / static_cast<double>(rows-1);
+          const double v = ((y+0.5) / static_cast<double>(tileRows-1)) + node->tileStart[1];
           for (unsigned int x=0; x<columns-1; ++x) {
-            double u = (x+0.5) / static_cast<double>(columns-1);
+            const double u = ((x+0.5) / static_cast<double>(tileColumns-1) + node->tileStart[0]);
             c->set_variable("u", u);
             c->set_variable("v", v);
             const auto val = func.getExpr()->evaluate(*c);
@@ -338,17 +336,17 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
     }
   } else {
     for (unsigned int y=0; y<rows; ++y) {
-      const double v = y / static_cast<double>(rows-1);
+      const double v = (y / static_cast<double>(tileRows-1)) + node->tileStart[1];
       for (unsigned int x=0; x<columns; ++x) {
-        const double u = x / static_cast<double>(columns-1);
+        const double u = (x / static_cast<double>(tileColumns-1)) + node->tileStart[0];
         node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = Vector3d(u, v, 0.5).cwiseProduct(node->size);
         node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_grid, columns, rows)] = Vector3d(0, 0, 1);
       }
     }
     for (unsigned int y=0; y<rows-1; ++y) {
-      const double v = (y+0.5) / static_cast<double>(rows-1);
+      const double v = ((y+0.5) / static_cast<double>(tileRows-1)) + node->tileStart[1];
       for (unsigned int x=0; x<columns-1; ++x) {
-        const double u = (x+0.5) / static_cast<double>(columns-1);
+        const double u = ((x+0.5) / static_cast<double>(tileColumns-1) + node->tileStart[0]);
         node->shapeGridPoints[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = Vector3d(u, v, 0.5).cwiseProduct(node->size);
         node->shapeGridNormals[gridCoord2Idx(x, y, GridCoordType::front_cell, columns, rows)] = Vector3d(0, 0, 1);
       }
@@ -625,7 +623,7 @@ Vector3d getPillLineIntersectionAtPillStart(const Vector3d& start, const Vector3
 
 double getZAt(int row, int column, double xDataStep, double yDataStep, const map_data_t& data)
 {
-  return data[round(column * xDataStep) + round(row * yDataStep) * data.width];
+  return data[(static_cast<int>(round(column * xDataStep)) % data.width) + (static_cast<int>(round(row * yDataStep)) % data.height) * data.width];
 }
 
 // FIXME: Look for faster way to generate PolySet directly
@@ -635,8 +633,13 @@ std::unique_ptr<const Geometry> HeightMapNode::createGeometry() const
     return {};
   auto data = read_png_or_dat(filename);
 
-  const int columns = ceil(data.width / pixelStep) + 1;
-  const int rows = ceil(data.height / pixelStep) + 1;
+  auto tileWidth = data.width;
+  auto tileHeight = data.height;
+  const int tileColumns = ceil(tileWidth / pixelStep) + 1;
+  const int tileRows = ceil(tileHeight / pixelStep) + 1;
+
+  const int columns = ceil(data.width * tiles[0] / pixelStep) + 1;
+  const int rows = ceil(data.height * tiles[1] / pixelStep) + 1;
 
   const double width = size.x();
   const double height = size.y();
