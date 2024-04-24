@@ -74,6 +74,7 @@ public:
   std::string shapeExpr;
   std::vector<Vector3d> shapeGridPoints;
   std::vector<Vector3d> shapeGridNormals;
+  std::array<double, 2> tiles;
 
   std::pair<unsigned int, unsigned int> getDataSize(std::string filename) const;
   std::unique_ptr<const Geometry> createGeometry() const override;

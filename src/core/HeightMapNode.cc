@@ -148,7 +148,7 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
 
   Parameters parameters =
       Parameters::parse(std::move(arguments), inst->location(),
-                        {"file", "size", "center", "convexity"}, {"invert", "doubleSided", "thickness", "pixelStep", "fadeTo", "fadeWidth", "shape", "cutout"});
+                        {"file", "size", "center", "convexity"}, {"invert", "doubleSided", "thickness", "pixelStep", "fadeTo", "fadeWidth", "shape", "cutout", "tiles"});
 
   std::string fileval = parameters["file"].isUndefined() ? "" : parameters["file"].toString();
   auto filename = lookup_file(fileval, inst->location().filePath().parent_path().string(), parameters.documentRoot());
@@ -208,6 +208,13 @@ static std::shared_ptr<AbstractNode> builtin_heightmap(const ModuleInstantiation
   } else {
     for(int i=0; i<4; ++i)
       node->fadeWidth[i] = 0;
+  }
+
+  if (parameters["tiles"].type() == Value::Type::VECTOR) {
+    parameters["tiles"].getVec2(node->tiles[0], node->tiles[1]);
+  } else {
+    node->tiles[0] = 1.0;
+    node->tiles[1] = 1.0;
   }
 
   auto size = node->getDataSize(filename);
